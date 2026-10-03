@@ -3,6 +3,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <shlwapi.h>
 #include <ole2.h>
 #include <imm.h>
@@ -27,6 +28,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "navigation.h"
 
 using namespace winrt;
 using namespace Windows::Foundation;
@@ -39,9 +41,10 @@ using namespace std::chrono_literals;
 constexpr wchar_t APP_NAME[] = L"包子PDF";
 constexpr UINT WM_RESULT = WM_APP + 1;
 constexpr uint64_t MAX_PIXELS = 12'000'000;
-enum Command { Open=100, Prev, Next, PageEdit, ZoomOut, ZoomIn, FitPage, FitWidth, Rotate, Full, Help, CloseDoc, Actual, GoPage, HelpDetails, EnableExcel, DisableExcel };
+enum Command { Open=100, Prev, Next, PageEdit, ZoomOut, ZoomIn, FitPage, FitWidth, Rotate, Full, Help, CloseDoc, Actual, GoPage, HelpDetails, EnableExcel, DisableExcel, AssociatePdf };
 enum class Fit { Page, Width, Custom };
 int RegisterExcel(bool enable);
+int RegisterPdf();
 
 struct Request {
     uint64_t generation=0, fileId=0;
@@ -163,6 +166,8 @@ struct App {
     int scrollX=0,scrollY=0,dpi=96;
     bool busy=false, fullscreen=false, dragging=false;
     bool oleMode=false;
+    bool bottomOnArrival=false;
+    int wheelRemainder=0;
     POINT dragStart{};
     int dragX=0,dragY=0;
     WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
@@ -225,6 +230,7 @@ struct App {
         SetWindowTextW(zoomLabel,bitmap?(std::to_wstring(int(std::round(bitmap->zoom*100)))+L"%").c_str():L"—");
     }
     void OpenFile(const std::wstring& path) {
+        bottomOnArrival=false;wheelRemainder=0;
         try { request.path=LocalPath(path); }
         catch(const hresult_error& e){MessageBoxW(window,e.message().c_str(),L"无法打开",MB_ICONINFORMATION);return;}
         request.embedded.reset();
@@ -233,6 +239,7 @@ struct App {
         SetWindowTextW(window,(std::filesystem::path(request.path).filename().wstring()+L" — "+APP_NAME).c_str());Queue(true);
     }
     void OpenEmbedded(std::shared_ptr<std::vector<uint8_t>> bytes,const std::wstring& title) {
+        bottomOnArrival=false;wheelRemainder=0;
         KillTimer(window,2);KillTimer(window,1);request.embedded=std::move(bytes);request.path=L"Excel 内嵌 PDF";
         ++request.fileId;request.password.clear();request.page=0;request.rotation=0;request.fit=Fit::Page;pageCount=0;
         SetWindowTextW(window,(title+L" — "+APP_NAME).c_str());ShowWindow(window,SW_SHOWNORMAL);SetForegroundWindow(window);Queue(true);
@@ -245,11 +252,21 @@ struct App {
         if(GetOpenFileNameW(&o))OpenFile(filename.data());
     }
     void CloseFile() {
+        bottomOnArrival=false;wheelRemainder=0;
         KillTimer(window,1);++latest;request.path.clear();request.embedded.reset();request.password.clear();++request.fileId;pageCount=0;bitmap.reset();busy=false;
         {std::lock_guard<std::mutex> lock(mutex);pending=request;}condition.notify_one();
         status=L"本地阅读 · 不保存历史";SetWindowTextW(window,APP_NAME);UpdateControls();UpdateScroll();InvalidateRect(window,nullptr,TRUE);InvalidateRect(canvas,nullptr,FALSE);
     }
-    void Navigate(int64_t p) {if(!pageCount)return;auto n=uint32_t(std::clamp<int64_t>(p,0,pageCount-1));if(n!=request.page){request.page=n;Queue(true);}SetFocus(canvas);}
+    void Navigate(int64_t p,bool arriveBottom=false) {if(!pageCount)return;auto n=uint32_t(std::clamp<int64_t>(p,0,pageCount-1));if(n!=request.page){bottomOnArrival=arriveBottom;request.page=n;Queue(true);}SetFocus(canvas);}
+    void Wheel(int delta){
+        if(!pageCount||!bitmap||busy)return;
+        if((wheelRemainder<0&&delta>0)||(wheelRemainder>0&&delta<0))wheelRemainder=0;
+        wheelRemainder+=delta;int ticks=wheelRemainder/WHEEL_DELTA;wheelRemainder%=WHEEL_DELTA;
+        int maximum=std::max(0,int(bitmap->height)+Px(48)-int(View().bottom));
+        auto move=MoveWheel(request.page,pageCount,scrollY,maximum,ticks,Px(72));
+        if(move.page!=request.page)Navigate(move.page,move.bottomOnArrival);
+        else {scrollY=move.offset;Scroll(0,0);}
+    }
     void Zoom(double factor) {if(!pageCount)return;double base=request.fit==Fit::Custom?request.zoom:(bitmap?bitmap->zoom:request.zoom);request.zoom=std::clamp(base*factor,0.1,8.0);request.fit=Fit::Custom;scrollX=scrollY=0;Queue();SetFocus(canvas);}
     void ToggleFullscreen() {
         if(!fullscreen){GetWindowPlacement(window,&placement);SetWindowLongPtrW(window,GWL_STYLE,WS_POPUP|WS_VISIBLE|WS_CLIPCHILDREN);
@@ -268,9 +285,10 @@ struct App {
         case Rotate:if(pageCount){request.rotation=(request.rotation+1)%4;Queue(true);}SetFocus(canvas);break;
         case Full:ToggleFullscreen();SetFocus(canvas);break;
         case CloseDoc:if(oleMode)PostMessageW(window,WM_CLOSE,0,0);else CloseFile();break;
-        case Help:{HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING,HelpDetails,L"使用帮助");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,EnableExcel,L"启用 Excel 内嵌 PDF");AppendMenuW(menu,MF_STRING,DisableExcel,L"恢复原有 Excel PDF 关联");RECT r{};GetWindowRect(GetDlgItem(window,Help),&r);int selected=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_LEFTALIGN,r.left,r.bottom,0,window,nullptr);DestroyMenu(menu);if(selected)Command(selected);break;}
+        case Help:{HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING,HelpDetails,L"使用帮助");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,AssociatePdf,L"关联 PDF / 设为默认阅读器");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,EnableExcel,L"启用 Excel 内嵌 PDF");AppendMenuW(menu,MF_STRING,DisableExcel,L"恢复原有 Excel PDF 关联");RECT r{};GetWindowRect(GetDlgItem(window,Help),&r);int selected=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_LEFTALIGN,r.left,r.bottom,0,window,nullptr);DestroyMenu(menu);if(selected)Command(selected);break;}
+        case AssociatePdf:if(RegisterPdf()==0)ShellExecuteW(window,L"open",L"ms-settings:defaultapps?registeredAppUser=BaoziPDF",nullptr,nullptr,SW_SHOWNORMAL);break;
         case EnableExcel:case DisableExcel:if(RegisterExcel(cmd==EnableExcel)==0)MessageBoxW(window,cmd==EnableExcel?L"已为当前用户启用。\n\n请关闭 Adobe 和 Excel，再重新打开工作簿。\n之后双击已有的 Adobe 类型 PDF 图标即可阅读。\n\n请将本程序保留在当前位置；移动后需重新启用。":L"已恢复启用前的 Excel PDF 对象关联。\n请重新打开 Excel。",L"Excel 内嵌 PDF",MB_OK);break;
-        case HelpDetails:MessageBoxW(window,L"包子PDF  1.0\n\n打开文件  Ctrl+O   ·   支持拖入 PDF\n翻页  ← / → 或 PageUp / PageDown\n首页 / 末页  Home / End\n跳转页码  Ctrl+G，输入后按 Enter\n缩放  Ctrl+滚轮 或 + / −\n适合整页  Ctrl+0   ·   适合宽度  Ctrl+1\n原始大小  Ctrl+2   ·   顺时针旋转  R\n全屏  F11   ·   退出全屏  Esc\n关闭文档  Ctrl+W   ·   退出程序  Alt+F4\n滚轮上下移动；拖动页面、滚动条或上下方向键平移；Shift+滚轮横向滚动。\n\n使用 Windows 系统 PDF 能力。只读、无账号、无联网代码、\n无更新器、无历史记录、无后台服务。\n支持已验收的 Adobe 类型 Excel 内嵌 PDF（需注册）。\n本版不提供文字选择、搜索、目录或 PDF 编辑。",L"使用帮助",MB_OK);break;
+        case HelpDetails:MessageBoxW(window,L"包子PDF  1.0\n\n打开文件  Ctrl+O   ·   支持拖入 PDF\n翻页  ← / → 或 PageUp / PageDown\n首页 / 末页  Home / End\n跳转页码  Ctrl+G，输入后按 Enter\n缩放  Ctrl+滚轮 或 + / −\n适合整页  Ctrl+0   ·   适合宽度  Ctrl+1\n原始大小  Ctrl+2   ·   顺时针旋转  R\n全屏  F11   ·   退出全屏  Esc\n关闭文档  Ctrl+W   ·   退出程序  Alt+F4\n滚轮上下移动，到页边界继续滚动可翻页；拖动页面、滚动条或上下方向键平移；Shift+滚轮横向滚动。\n\n使用 Windows 系统 PDF 能力。只读、无账号、无联网代码、\n无更新器、无历史记录、无后台服务。\n支持已验收的 Adobe 类型 Excel 内嵌 PDF（需注册）。\n本版不提供文字选择、搜索、目录或 PDF 编辑。",L"使用帮助",MB_OK);break;
         }
     }
     void UpdateScroll() {
@@ -323,7 +341,7 @@ LRESULT CALLBACK CanvasProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_MOUSEWHEEL:{int delta=GET_WHEEL_DELTA_WPARAM(wp);
         if(GET_KEYSTATE_WPARAM(wp)&MK_CONTROL){if(delta)app->Zoom(std::pow(1.25,double(delta)/WHEEL_DELTA));}
         else if(GET_KEYSTATE_WPARAM(wp)&MK_SHIFT)app->Scroll(-delta,0);
-        else app->Scroll(0,-delta);
+        else app->Wheel(delta);
         return 0;}
     case WM_HSCROLL:case WM_VSCROLL:{int bar=msg==WM_HSCROLL?SB_HORZ:SB_VERT;SCROLLINFO si{sizeof(si),SIF_ALL};GetScrollInfo(hwnd,bar,&si);int pos=si.nPos;
         switch(LOWORD(wp)){case SB_LINEUP:pos-=app->Px(36);break;case SB_LINEDOWN:pos+=app->Px(36);break;case SB_PAGEUP:pos-=int(si.nPage)*9/10;break;case SB_PAGEDOWN:pos+=int(si.nPage)*9/10;break;case SB_THUMBTRACK:pos=si.nTrackPos;break;case SB_TOP:pos=0;break;case SB_BOTTOM:pos=si.nMax;break;}
@@ -342,7 +360,7 @@ LRESULT CALLBACK MainProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
         app->totalLabel=create(500,L"STATIC",L"/ —",SS_CENTERIMAGE);
         create(ZoomOut,L"BUTTON",L"−",BS_PUSHBUTTON|WS_TABSTOP);app->zoomLabel=create(501,L"STATIC",L"—",SS_CENTER|SS_CENTERIMAGE);create(ZoomIn,L"BUTTON",L"+",BS_PUSHBUTTON|WS_TABSTOP);
         create(FitPage,L"BUTTON",L"整页",BS_PUSHBUTTON|WS_TABSTOP);create(FitWidth,L"BUTTON",L"宽度",BS_PUSHBUTTON|WS_TABSTOP);create(Rotate,L"BUTTON",L"旋转",BS_PUSHBUTTON|WS_TABSTOP);create(Full,L"BUTTON",L"全屏",BS_PUSHBUTTON|WS_TABSTOP);create(Help,L"BUTTON",L"帮助",BS_PUSHBUTTON|WS_TABSTOP);
-        app->canvas=CreateWindowExW(0,L"QingYueCanvas",L"PDF 页面",WS_CHILD|WS_VISIBLE|WS_HSCROLL|WS_VSCROLL|WS_TABSTOP,0,0,1,1,hwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
+        app->canvas=CreateWindowExW(0,L"BaoziCanvas",L"PDF 页面",WS_CHILD|WS_VISIBLE|WS_HSCROLL|WS_VSCROLL|WS_TABSTOP,0,0,1,1,hwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
         ImmAssociateContext(app->canvas,nullptr);ImmAssociateContext(app->pageEdit,nullptr);
         DragAcceptFiles(hwnd,TRUE);DragAcceptFiles(app->canvas,TRUE);app->SetFonts();app->Layout();app->UpdateControls();app->StartWorker();return 0;}
     case WM_COMMAND:if(HIWORD(wp)==BN_CLICKED)app->Command(LOWORD(wp));return 0;
@@ -366,7 +384,7 @@ LRESULT CALLBACK MainProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
         if(!app->request.password.empty()){SecureZeroMemory(app->request.password.data(),app->request.password.size()*sizeof(wchar_t));app->request.password.clear();}
         app->pageCount=r->count;app->request.page=r->page;app->request.zoom=r->zoom;
         app->status=L"第 "+std::to_wstring(r->page+1)+L" / "+std::to_wstring(r->count)+L" 页   ·   只读"+(r->limited?L"   ·   已限制位图尺寸以控制内存":L"");
-        app->bitmap=std::move(r);app->UpdateScroll();app->UpdateControls();InvalidateRect(app->canvas,nullptr,FALSE);InvalidateRect(hwnd,nullptr,FALSE);return 0;}
+        app->bitmap=std::move(r);if(app->bottomOnArrival){app->scrollY=INT_MAX;app->bottomOnArrival=false;}app->UpdateScroll();app->UpdateControls();InvalidateRect(app->canvas,nullptr,FALSE);InvalidateRect(hwnd,nullptr,FALSE);return 0;}
     case WM_CLOSE:CloseOleObjects();app->Shutdown();DestroyWindow(hwnd);return 0;
     case WM_DESTROY:PostQuitMessage(0);return 0;
     }
@@ -421,11 +439,17 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
         if(args.size()==3&&args[0]==L"--self-test"){init_apartment(apartment_type::multi_threaded);return SelfTest(args[1],args[2]);}
         if(args.size()==3&&args[0]==L"--verify-pdf"){init_apartment(apartment_type::multi_threaded);return VerifyPdf(args[1],args[2]);}
         if(args.size()==1&&(args[0]==L"--enable-excel"||args[0]==L"--disable-excel"))return RegisterExcel(args[0]==L"--enable-excel");
+        if(args.size()==1&&args[0]==L"--register-pdf")return RegisterPdf();
+        if((args.size()==2||args.size()==3)&&args[0]==L"--migrate-settings"){
+            int result=MigrateSettings(args[1]);if(!result)result=RegisterExcel(true);if(!result)result=RegisterPdf();
+            if(args.size()==3){std::ofstream report{std::filesystem::path(args[2])};report<<"configuration_exit="<<result<<'\n';}
+            return result;
+        }
         check_hresult(OleInitialize(nullptr));
         INITCOMMONCONTROLSEX cc{sizeof(cc),ICC_STANDARD_CLASSES};InitCommonControlsEx(&cc);
         App state;app=&state;state.oleMode=std::any_of(args.begin(),args.end(),[](const auto& a){return _wcsicmp(a.c_str(),L"-Embedding")==0||a==L"--ole";});
-        WNDCLASSW canvas{};canvas.hInstance=instance;canvas.lpfnWndProc=CanvasProc;canvas.lpszClassName=L"QingYueCanvas";canvas.hCursor=LoadCursorW(nullptr,IDC_ARROW);RegisterClassW(&canvas);
-        WNDCLASSW wc{};wc.hInstance=instance;wc.lpfnWndProc=MainProc;wc.lpszClassName=L"QingYuePDF";wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.hIcon=LoadIconW(nullptr,IDI_APPLICATION);RegisterClassW(&wc);
+        WNDCLASSW canvas{};canvas.hInstance=instance;canvas.lpfnWndProc=CanvasProc;canvas.lpszClassName=L"BaoziCanvas";canvas.hCursor=LoadCursorW(nullptr,IDC_ARROW);RegisterClassW(&canvas);
+        WNDCLASSW wc{};wc.hInstance=instance;wc.lpfnWndProc=MainProc;wc.lpszClassName=L"BaoziPDF";wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.hIcon=LoadIconW(nullptr,IDI_APPLICATION);RegisterClassW(&wc);
         auto hwnd=CreateWindowExW(0,wc.lpszClassName,APP_NAME,WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,1120,820,nullptr,nullptr,instance,nullptr);
         if(!hwnd)return 2;
         DWORD oleCookie=0;

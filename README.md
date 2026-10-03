@@ -25,7 +25,7 @@
 
 运行 `dist/包子PDF.exe`。程序为单个 x64 EXE，无需安装运行库。
 
-原文件名 `QingYuePDF.exe` 的同版本兼容副本保留在本机，以维持已有 Excel 对象关联；新发行包只包含 `包子PDF.exe` 和使用说明。
+发行包只包含 `包子PDF.exe` 和使用说明，不再生成旧名称的兼容副本。
 
 打开本机 PDF：点击“打开”、按 Ctrl+O、拖入文件，或将 PDF 拖到 EXE 上。
 
@@ -39,7 +39,14 @@
 | 顺时针旋转 | R |
 | 全屏 / 退出全屏 | F11 / Esc |
 | 关闭文档 / 退出 | Ctrl+W / Alt+F4 |
-| 页面平移 | 滚轮上下移动；拖动页面、滚动条、上下方向键；Shift+滚轮横向滚动 |
+| 页面平移与翻页 | 滚轮上下移动；到页底/页顶继续滚动进入下页/上页，整页显示时直接翻页 |
+| 页面平移 | 拖动页面、滚动条、上下方向键；Shift+滚轮横向滚动 |
+
+## 系统 PDF 文件关联
+
+选择 **帮助 → 关联 PDF / 设为默认阅读器**。程序会将包子PDF注册到 Windows 的 PDF“打开方式”和默认应用列表，并打开系统默认应用设置。选择 `.pdf` 并指定包子PDF后，双击硬盘上的 PDF 就会启动它。
+
+这与 Excel 内嵌 PDF 关联是两个独立功能。程序使用 Windows 支持的关联注册，不改写系统保护的 UserChoice 哈希。移动 EXE 后应重新注册。
 
 ## Excel 中已有的 Adobe 内嵌 PDF
 
@@ -59,7 +66,7 @@
 - 不提供搜索、文字选择复制、目录读取、编辑、OCR、表单填写、打印或连续多页滚动。
 - 只有一个渲染工作线程，只保留当前页和当前渲染结果；新请求取代旧请求。单页位图限制为 1200 万像素，边长限制为 8192，超限时自动降低实际缩放并提示。
 - 程序本身无联网客户端、更新器、账号、遥测、历史记录、开机启动、后台服务或计划任务。关闭阅读窗口后退出；OLE 激活但没有显示文档时最多等待 30 秒后退出。
-- 本机文件阅读不写设置或注册表。只有明确启用/恢复 Excel 兼容时，才操作 `HKCU\Software\Classes\CLSID` 和 `HKCU\Software\QingYuePDF\OleBackup`。恢复时检查注册的所有者，避免覆盖其他程序的后续修改。
+- 普通阅读不写设置或注册表。系统 PDF 关联与 Excel 兼容仅在用户启用时注册到当前用户；Excel 恢复备份保存在 `HKCU\Software\BaoziPDF\OleBackup`。恢复时检查注册所有者，避免覆盖其他程序的后续修改。
 - 不包含独立 PDF 引擎或浏览器。仅依赖 Windows 系统 DLL；系统 PDF 能力的更新由 Windows 提供。
 - 面向 Windows 10 1607 及以上的 x64 系统；本次实际验收环境见 `ACCEPTANCE.md`。未在其他系统版本上实测。
 
@@ -83,7 +90,9 @@
 .\build\Release\OleProbe.exe "完整路径\oleObject1.bin" "完整路径\ole-probe.tsv"
 ```
 
-命令行接口另外支持 `--enable-excel`、`--disable-excel`。开发工具在打包应用上下文中执行时，注册表可能被虚拟化；应通过 Windows 文件管理器或程序内菜单启用，让 Excel 的外部 COM 激活能够读取实际用户注册。
+滚轮规则回归检查：`ctest --test-dir build -C Release --output-on-failure`。
+
+命令行接口另外支持 `--enable-excel`、`--disable-excel`、`--register-pdf`。开发工具在打包应用上下文中执行时，注册表可能被虚拟化；应通过 Windows 文件管理器或程序内菜单启用，让 Excel 的外部 COM 激活能够读取实际用户注册。
 
 测试依赖见 `tests/requirements.txt`。生成器使用 Windows 自带的微软雅黑字体；生成的测试 PDF 不纳入仓库。用户提供的工作簿副本及截图仅保存在本地 `tests/private`，不纳入仓库或发行包。
 

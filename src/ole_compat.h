@@ -118,15 +118,8 @@ void RegCheck(LSTATUS result){if(result!=ERROR_SUCCESS)throw hresult_error(HRESU
 void RegString(HKEY parent,const wchar_t* subkey,const wchar_t* name,const std::wstring& value){RegKey k;RegCheck(RegCreateKeyExW(parent,subkey,0,nullptr,0,KEY_ALL_ACCESS,nullptr,&k.key,nullptr));RegCheck(RegSetValueExW(k,name,0,REG_SZ,reinterpret_cast<const BYTE*>(value.c_str()),DWORD((value.size()+1)*2)));}
 void RegisterExcelView(bool enable,REGSAM view,const wchar_t* backupName,const std::wstring& exe) {
     const std::wstring cls=L"Software\\Classes\\CLSID\\"+std::wstring(PDF_CLSID_TEXT);
-    const std::wstring backup=L"Software\\QingYuePDF\\OleBackup\\"+std::wstring(backupName);
+    const std::wstring backup=L"Software\\BaoziPDF\\OleBackup\\"+std::wstring(backupName);
     RegKey user;RegCheck(RegOpenKeyExW(HKEY_CURRENT_USER,L"",0,KEY_ALL_ACCESS|view,&user.key));
-    // Remove only this executable's obsolete pre-release test registration.
-    const wchar_t* preview=L"Software\\Classes\\CLSID\\{D860CD38-02D0-4EEC-BF0F-39449BD68D94}";
-    RegKey obsolete;std::wstring oldServer=std::wstring(preview)+L"\\LocalServer32";
-    if(RegOpenKeyExW(user,oldServer.c_str(),0,KEY_READ,&obsolete.key)==ERROR_SUCCESS){
-        wchar_t owner[32768]{};DWORD n=sizeof(owner);
-        if(RegQueryValueExW(obsolete,L"ServerExecutable",nullptr,nullptr,reinterpret_cast<BYTE*>(owner),&n)==ERROR_SUCCESS&&exe==owner){RegCloseKey(obsolete.key);obsolete.key=nullptr;RegDeleteTreeW(user,preview);RegDeleteTreeW(user,L"Software\\Classes\\QingYuePDF.Document.1");}
-    }
     RegKey saved;
     if(enable){
         DWORD disposition=0;RegCheck(RegCreateKeyExW(user,backup.c_str(),0,nullptr,0,KEY_ALL_ACCESS,nullptr,&saved.key,&disposition));
@@ -162,4 +155,53 @@ int RegisterExcel(bool enable){
         RegisterExcelView(enable,KEY_WOW64_32KEY,L"x86",path);
         return 0;
     }catch(const hresult_error& e){MessageBoxW(nullptr,e.message().c_str(),L"Excel 兼容注册失败",MB_ICONERROR);return 1;}
+}
+
+int RegisterPdf(){
+    try{
+        wchar_t filename[32768]{};GetModuleFileNameW(nullptr,filename,32768);
+        std::wstring exe=filename,command=L"\""+exe+L"\" \"%1\"";
+        RegString(HKEY_CURRENT_USER,L"Software\\Classes\\BaoziPDF.Document",nullptr,L"包子PDF 文档");
+        RegString(HKEY_CURRENT_USER,L"Software\\Classes\\BaoziPDF.Document",L"FriendlyTypeName",L"包子PDF 文档");
+        RegString(HKEY_CURRENT_USER,L"Software\\Classes\\BaoziPDF.Document\\DefaultIcon",nullptr,L"\""+exe+L"\",0");
+        RegString(HKEY_CURRENT_USER,L"Software\\Classes\\BaoziPDF.Document\\shell\\open\\command",nullptr,command);
+        std::wstring application=L"Software\\Classes\\Applications\\"+std::filesystem::path(exe).filename().wstring();
+        RegString(HKEY_CURRENT_USER,application.c_str(),L"FriendlyAppName",APP_NAME);
+        RegString(HKEY_CURRENT_USER,(application+L"\\SupportedTypes").c_str(),L".pdf",L"");
+        RegString(HKEY_CURRENT_USER,(application+L"\\shell\\open\\command").c_str(),nullptr,command);
+        RegKey openWith;RegCheck(RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\Classes\\.pdf\\OpenWithProgids",0,nullptr,0,KEY_SET_VALUE,nullptr,&openWith.key,nullptr));
+        RegCheck(RegSetValueExW(openWith,L"BaoziPDF.Document",0,REG_NONE,nullptr,0));
+        RegString(HKEY_CURRENT_USER,L"Software\\BaoziPDF\\Capabilities",L"ApplicationName",APP_NAME);
+        RegString(HKEY_CURRENT_USER,L"Software\\BaoziPDF\\Capabilities",L"ApplicationDescription",L"轻量只读 PDF 阅读器，支持 Excel 内嵌 PDF");
+        RegString(HKEY_CURRENT_USER,L"Software\\BaoziPDF\\Capabilities\\FileAssociations",L".pdf",L"BaoziPDF.Document");
+        RegString(HKEY_CURRENT_USER,L"Software\\RegisteredApplications",L"BaoziPDF",L"Software\\BaoziPDF\\Capabilities");
+        SHChangeNotify(SHCNE_ASSOCCHANGED,SHCNF_IDLIST,nullptr,nullptr);
+        return 0;
+    }catch(const hresult_error& e){MessageBoxW(nullptr,e.message().c_str(),L"PDF 文件关联失败",MB_ICONERROR);return 1;}
+}
+
+// Explicit one-time maintenance command. Accept only a sibling installation's
+// own backup, preserving its original restoration data when changing branding.
+int MigrateSettings(const std::wstring& previous){
+    try{
+        if(previous.empty()||previous==L"BaoziPDF"||previous.find_first_of(L"\\/")!=std::wstring::npos)return 2;
+        RegKey software;RegCheck(RegOpenKeyExW(HKEY_CURRENT_USER,L"Software",0,KEY_ALL_ACCESS,&software.key));
+        RegKey old;auto status=RegOpenKeyExW(software,previous.c_str(),0,KEY_READ,&old.key);
+        if(status==ERROR_FILE_NOT_FOUND)return 0;RegCheck(status);
+        RegKey proof;RegCheck(RegOpenKeyExW(old,L"OleBackup\\x64",0,KEY_READ,&proof.key));
+        wchar_t owner[32768]{},exe[32768]{};DWORD bytes=sizeof(owner);
+        RegCheck(RegQueryValueExW(proof,L"Executable",nullptr,nullptr,reinterpret_cast<BYTE*>(owner),&bytes));
+        GetModuleFileNameW(nullptr,exe,32768);
+        if(std::filesystem::path(owner).parent_path()!=std::filesystem::path(exe).parent_path())return 3;
+        RegKey target;RegCheck(RegCreateKeyExW(software,L"BaoziPDF",0,nullptr,0,KEY_ALL_ACCESS,nullptr,&target.key,nullptr));
+        RegKey existing;if(RegOpenKeyExW(target,L"OleBackup",0,KEY_READ,&existing.key)==ERROR_SUCCESS)return 4;
+        RegKey sourceBackup,destBackup;
+        RegCheck(RegOpenKeyExW(old,L"OleBackup",0,KEY_READ,&sourceBackup.key));
+        RegCheck(RegCreateKeyExW(target,L"OleBackup",0,nullptr,0,KEY_ALL_ACCESS,nullptr,&destBackup.key,nullptr));
+        RegCheck(RegCopyTreeW(sourceBackup,nullptr,destBackup));
+        RegCloseKey(sourceBackup.key);sourceBackup.key=nullptr;RegCloseKey(proof.key);proof.key=nullptr;RegCloseKey(old.key);old.key=nullptr;
+        RegCheck(RegDeleteTreeW(software,(previous+L"\\OleBackup").c_str()));
+        RegDeleteKeyW(software,previous.c_str()); // succeeds only if no unrelated subkeys remain
+        return 0;
+    }catch(const hresult_error& e){MessageBoxW(nullptr,e.message().c_str(),L"配置迁移失败",MB_ICONERROR);return 1;}
 }

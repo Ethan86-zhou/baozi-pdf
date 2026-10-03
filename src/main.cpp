@@ -449,7 +449,9 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
         INITCOMMONCONTROLSEX cc{sizeof(cc),ICC_STANDARD_CLASSES};InitCommonControlsEx(&cc);
         App state;app=&state;state.oleMode=std::any_of(args.begin(),args.end(),[](const auto& a){return _wcsicmp(a.c_str(),L"-Embedding")==0||a==L"--ole";});
         WNDCLASSW canvas{};canvas.hInstance=instance;canvas.lpfnWndProc=CanvasProc;canvas.lpszClassName=L"BaoziCanvas";canvas.hCursor=LoadCursorW(nullptr,IDC_ARROW);RegisterClassW(&canvas);
-        WNDCLASSW wc{};wc.hInstance=instance;wc.lpfnWndProc=MainProc;wc.lpszClassName=L"BaoziPDF";wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);wc.hIcon=LoadIconW(nullptr,IDI_APPLICATION);RegisterClassW(&wc);
+        WNDCLASSEXW wc{sizeof(wc)};wc.hInstance=instance;wc.lpfnWndProc=MainProc;wc.lpszClassName=L"BaoziPDF";wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
+        wc.hIcon=static_cast<HICON>(LoadImageW(instance,MAKEINTRESOURCEW(1),IMAGE_ICON,GetSystemMetrics(SM_CXICON),GetSystemMetrics(SM_CYICON),LR_SHARED));
+        wc.hIconSm=static_cast<HICON>(LoadImageW(instance,MAKEINTRESOURCEW(1),IMAGE_ICON,GetSystemMetrics(SM_CXSMICON),GetSystemMetrics(SM_CYSMICON),LR_SHARED));RegisterClassExW(&wc);
         auto hwnd=CreateWindowExW(0,wc.lpszClassName,APP_NAME,WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,1120,820,nullptr,nullptr,instance,nullptr);
         if(!hwnd)return 2;
         DWORD oleCookie=0;

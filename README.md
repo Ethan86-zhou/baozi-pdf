@@ -80,6 +80,8 @@
 
 输出为 `dist/包子PDF.exe`。MSVC C++ 运行库静态链接。依赖 Windows 的 C++/WinRT 头文件、PDF 与位图接口。
 
+程序内嵌包子造型图标，供 EXE、窗口、任务栏及 PDF 文件关联使用。图标源文件位于 `src/assets/baozi.svg`；运行 `python tools/make_icon.py` 可用 Pillow 重新生成 PNG 和含 16–256 像素九种尺寸的 ICO。正常构建直接使用仓库内的 ICO，不需要 Python。
+
 ## 测试
 
 `tests/make_fixtures.py` 使用仅供开发的 ReportLab、Pillow、pypdf 生成测试 PDF。这些工具及测试 PDF 均不随 EXE 运行。

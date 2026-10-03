@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+<rect x="8" y="8" width="240" height="240" rx="54" fill="#12616B"/>
+<path d="M124 65 C110 69 105 81 86 86 C56 96 37 120 37 148 C37 179 65 193 123 193 C181 193 211 178 211 148 C211 119 190 95 161 85 C143 79 137 68 124 65 Z" fill="#FFF3DA" stroke="none" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M45 168 C72 185 177 185 204 167 C193 187 169 193 123 193 C82 193 56 186 45 168 Z" fill="#EBCB91" stroke="none" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M121 82 C107 94 100 107 100 123" fill="none" stroke="#C5914A" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M130 82 C143 94 149 107 149 123" fill="none" stroke="#C5914A" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M104 88 C89 98 78 108 75 122" fill="none" stroke="#C5914A" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M146 89 C162 98 173 109 177 122" fill="none" stroke="#C5914A" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="139" y="169" width="92" height="55" rx="16" fill="#E9654F"/>
+<text x="185" y="206" text-anchor="middle" font-family="Segoe UI, sans-serif" font-weight="700" font-size="27" fill="white">PDF</text>
+</svg>

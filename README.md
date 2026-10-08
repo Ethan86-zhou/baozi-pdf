@@ -19,13 +19,13 @@
 
 ## 技术方案
 
-原生 Windows 只读 PDF 阅读器，采用 C++ / Win32 + Windows.Data.Pdf。
+原生 Windows 只读 PDF 阅读器，采用 C++ / Win32 + Windows.Data.Pdf 显示页面，PDFium 读取文字层并定位搜索结果。
 
 ## 使用
 
-运行 `dist/包子PDF.exe`。程序为单个 x64 EXE，无需安装运行库。
+运行 `dist/包子PDF.exe`。x64 程序无需安装 C++ 运行库；`pdfium.dll` 必须与 EXE 放在同一目录。
 
-发行包只包含 `包子PDF.exe` 和使用说明，不再生成旧名称的兼容副本。
+发行包包含 `包子PDF.exe`、`pdfium.dll`、`PDFium-LICENSE.txt`、`licenses` 和使用说明。搜索组件约 7.5 MB，不再生成旧名称的兼容副本。
 
 打开本机 PDF：点击“打开”、按 Ctrl+O、拖入文件，或将 PDF 拖到 EXE 上。
 
@@ -34,6 +34,9 @@
 | 上页 / 下页 | 左右方向键、PageUp / PageDown |
 | 首页 / 末页 | Home / End |
 | 跳转页码 | Ctrl+G，输入后 Enter |
+| 搜索 PDF 文字层 | Ctrl+F；输入后自动搜索，Enter / Shift+Enter 下一处 / 上一处 |
+| 下一处 / 上一处搜索结果 | F3 / Shift+F3，或搜索栏按钮；首尾循环 |
+| 关闭搜索栏 | Esc |
 | 放大 / 缩小 | Ctrl+滚轮、+ / - |
 | 适合整页 / 宽度 / 100% | Ctrl+0 / Ctrl+1 / Ctrl+2 |
 | 顺时针旋转 | R |
@@ -41,6 +44,8 @@
 | 关闭文档 / 退出 | Ctrl+W / Alt+F4 |
 | 页面平移与翻页 | 滚轮上下移动；到页底/页顶继续滚动进入下页/上页，整页显示时直接翻页 |
 | 页面平移 | 拖动页面、滚动条、上下方向键；Shift+滚轮横向滚动 |
+
+搜索按文字层中的词或短语匹配，支持中文和英文，可勾选“区分大小写”。黄色标出当前页命中，橙色边框表示选中的命中，跳转时自动滚动到位置。搜索在后台执行，修改关键词或切换文档会取消旧搜索。关键词最多 256 个 UTF-16 代码单元；每次最多保留 5000 处，更多时显示 `5000+`。不做 OCR，扫描图片中的字不参与搜索；缺失或错误的 PDF 文字编码也会影响匹配。
 
 ## 系统 PDF 文件关联
 
@@ -63,11 +68,12 @@
 ## 功能与资源边界
 
 - 只读显示、单页浏览、打开、跳页、缩放、旋转、全屏、页内滚动；支持系统引擎能读取的加密 PDF，密码不持久保存。
-- 不提供搜索、文字选择复制、目录读取、编辑、OCR、表单填写、打印或连续多页滚动。
+- 支持全文文字层搜索、命中高亮与循环跳转；文件路径含中文、加密 PDF 和内存中的 Excel 内嵌 PDF 可搜索。密码只在当前文档打开期间保留在内存，不写入文件。
+- 不提供文字选择复制、目录读取、编辑、OCR、表单填写、打印或连续多页滚动。
 - 只有一个渲染工作线程，只保留当前页和当前渲染结果；新请求取代旧请求。单页位图限制为 1200 万像素，边长限制为 8192，超限时自动降低实际缩放并提示。
 - 程序本身无联网客户端、更新器、账号、遥测、历史记录、开机启动、后台服务或计划任务。关闭阅读窗口后退出；OLE 激活但没有显示文档时最多等待 30 秒后退出。
 - 普通阅读不写设置或注册表。系统 PDF 关联与 Excel 兼容仅在用户启用时注册到当前用户；Excel 恢复备份保存在 `HKCU\Software\BaoziPDF\OleBackup`。恢复时检查注册所有者，避免覆盖其他程序的后续修改。
-- 不包含独立 PDF 引擎或浏览器。仅依赖 Windows 系统 DLL；系统 PDF 能力的更新由 Windows 提供。
+- 页面渲染使用 Windows 系统引擎；附带不含 V8/XFA 的 PDFium，只用于文字层搜索。搜索线程一次处理一页，最多保留 5000 处命中的矩形，不生成全文索引或历史记录。
 - 面向 Windows 10 1607 及以上的 x64 系统；本次实际验收环境见 `ACCEPTANCE.md`。未在其他系统版本上实测。
 
 ## 构建
@@ -78,7 +84,9 @@
 .\build.ps1
 ```
 
-输出为 `dist/包子PDF.exe`。MSVC C++ 运行库静态链接。依赖 Windows 的 C++/WinRT 头文件、PDF 与位图接口。
+首次构建从 `bblanchon/pdfium-binaries` 下载固定版本 `157.0.8086.0`（`chromium/8086`）的 Windows x64 包，校验固定 SHA-256 后缓存到 `third_party/pdfium`。后续构建使用缓存。构建脚本可自动查找 Visual Studio 自带的 CMake。
+
+输出在 `dist`，包含 EXE、PDFium DLL 和许可证。MSVC C++ 运行库静态链接。依赖 Windows 的 C++/WinRT 头文件、PDF 与位图接口。
 
 程序内嵌包子造型图标，供 EXE、窗口、任务栏及 PDF 文件关联使用。图标源文件位于 `src/assets/baozi.svg`；运行 `python tools/make_icon.py` 可用 Pillow 重新生成 PNG 和含 16–256 像素九种尺寸的 ICO。正常构建直接使用仓库内的 ICO，不需要 Python。
 
@@ -92,7 +100,7 @@
 .\build\Release\OleProbe.exe "完整路径\oleObject1.bin" "完整路径\ole-probe.tsv"
 ```
 
-滚轮规则回归检查：`ctest --test-dir build -C Release --output-on-failure`。
+先运行 `python tests/make_fixtures.py` 生成测试文档，然后执行 `ctest --test-dir build -C Release --output-on-failure`。覆盖滚轮规则，以及真实 PDF 的中英文搜索、短语、大小写、旋转矩形、扫描页、加密、内嵌数据、大文档结果上限与取消。
 
 命令行接口另外支持 `--enable-excel`、`--disable-excel`、`--register-pdf`。开发工具在打包应用上下文中执行时，注册表可能被虚拟化；应通过 Windows 文件管理器或程序内菜单启用，让 Excel 的外部 COM 激活能够读取实际用户注册。
 
@@ -102,5 +110,7 @@
 
 - [Microsoft PdfDocument API](https://learn.microsoft.com/en-us/uwp/api/windows.data.pdf.pdfdocument)
 - [Microsoft PdfPageRenderOptions API](https://learn.microsoft.com/en-us/uwp/api/windows.data.pdf.pdfpagerenderoptions)
+- [PDFium text search API](https://pdfium.googlesource.com/pdfium/+/refs/heads/main/public/fpdf_text.h)
+- [PDFium Windows binaries and licenses](https://github.com/bblanchon/pdfium-binaries)
 - [Microsoft OLE Compound Documents](https://learn.microsoft.com/en-us/windows/win32/com/compound-documents)
 - [Microsoft IOleObject::DoVerb](https://learn.microsoft.com/en-us/windows/win32/api/oleidl/nf-oleidl-ioleobject-doverb)

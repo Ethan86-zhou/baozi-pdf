@@ -605,7 +605,13 @@ int SelfTest(const std::wstring& directory,const std::wstring& output) {
         uint64_t dark=0;for(size_t i=0;i<r.pixels.size();i+=4)if(r.pixels[i]<180)++dark;
         check(dark>1000,"render contains visible content");
         auto rotated=render(L"sample.pdf",0,1,1);check(rotated.width==r.height&&rotated.height==r.width,"90-degree rotation swaps dimensions");
-        auto half=render(L"sample.pdf",0,0,0.5);check(std::abs(int(half.width)*2-int(r.width))<=1,"50-percent zoom");
+        auto half=render(L"sample.pdf",0,0,0.5);
+        // Destination sizes are rounded to whole DIPs before the system PDF
+        // engine rounds again to physical pixels. Allow that bounded error.
+        const int zoomTolerance=int(std::ceil(std::max(1.0,GetDpiForSystem()/96.0)))+1;
+        log<<"INFO\tzoom dimensions full="<<r.width<<'x'<<r.height<<" half="<<half.width<<'x'<<half.height<<" tolerance="<<zoomTolerance<<'\n';
+        check(!half.limited&&half.zoom==0.5&&std::abs(int(half.width)*2-int(r.width))<=zoomTolerance&&
+            std::abs(int(half.height)*2-int(r.height))<=zoomTolerance,"50-percent zoom");
         auto high=render(L"sample.pdf",0,0,8);check(high.limited&&uint64_t(high.width)*high.height<=MAX_PIXELS,"800-percent zoom memory cap");
         auto landscape=render(L"sample.pdf",1,0,1);check(landscape.width>landscape.height,"landscape page");
         check(render(L"sample.pdf",2,0,1).pixels.size()>0,"scanned-image page");

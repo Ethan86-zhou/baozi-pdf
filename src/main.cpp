@@ -29,6 +29,7 @@
 #include <thread>
 #include <vector>
 #include "navigation.h"
+#include "text_search.h"
 
 using namespace winrt;
 using namespace Windows::Foundation;
@@ -40,8 +41,10 @@ using namespace std::chrono_literals;
 
 constexpr wchar_t APP_NAME[] = L"包子PDF";
 constexpr UINT WM_RESULT = WM_APP + 1;
+constexpr UINT WM_FIND_RESULT = WM_APP + 2;
+constexpr UINT WM_FIND_PROGRESS = WM_APP + 3;
 constexpr uint64_t MAX_PIXELS = 12'000'000;
-enum Command { Open=100, Prev, Next, PageEdit, ZoomOut, ZoomIn, FitPage, FitWidth, Rotate, Full, Help, CloseDoc, Actual, GoPage, HelpDetails, EnableExcel, DisableExcel, AssociatePdf };
+enum Command { Open=100, Prev, Next, PageEdit, ZoomOut, ZoomIn, FitPage, FitWidth, Rotate, Full, Help, CloseDoc, Actual, GoPage, HelpDetails, EnableExcel, DisableExcel, AssociatePdf, Find, FindEdit, FindPrev, FindNext, FindCase, FindDismiss };
 enum class Fit { Page, Width, Custom };
 int RegisterExcel(bool enable);
 int RegisterPdf();
@@ -63,6 +66,18 @@ struct Result {
     HRESULT error=S_OK;
     std::wstring message;
     std::vector<uint8_t> pixels;
+};
+struct FindTask {
+    SearchSource source;
+    uint64_t generation=0;
+    std::wstring query;
+    bool matchCase=false;
+    FindTask()=default;
+    FindTask(const FindTask&)=default;
+    FindTask& operator=(const FindTask&)=default;
+    FindTask(FindTask&&)=default;
+    FindTask& operator=(FindTask&&)=default;
+    ~FindTask(){if(!source.password.empty())SecureZeroMemory(source.password.data(),source.password.size()*sizeof(wchar_t));}
 };
 
 std::wstring LocalPath(std::wstring path) {
@@ -123,7 +138,10 @@ public:
         r.zoom=q.fit==Fit::Page ? std::min(q.width/sw,q.height/sh) : q.fit==Fit::Width ? q.width/sw : q.zoom;
         r.zoom=std::clamp(r.zoom,0.02,8.0);
         double scale=r.zoom;
-        double maxScale=std::min({std::sqrt(double(MAX_PIXELS)/(sw*sh)),8192.0/sw,8192.0/sh});
+        // Render options use DIPs; the PDF engine expands them to physical
+        // pixels at system DPI. Budget that expansion before rendering.
+        const double renderDpiScale=std::max(1.0,GetDpiForSystem()/96.0);
+        double maxScale=std::min({std::sqrt(double(MAX_PIXELS)/(sw*sh)),8192.0/sw,8192.0/sh})/renderDpiScale;
         if (scale>maxScale) { scale=maxScale; r.zoom=scale; r.limited=true; }
         const uint32_t w=std::max(1u,uint32_t(std::floor(size.Width*scale)));
         const uint32_t h=std::max(1u,uint32_t(std::floor(size.Height*scale)));
@@ -143,18 +161,29 @@ public:
         r.width=decoder.PixelWidth(); r.height=decoder.PixelHeight();
         if(q.rotation%2) std::swap(r.width,r.height);
         if(uint64_t(r.width)*r.height>MAX_PIXELS || bytes.size()!=uint64_t(r.width)*r.height*4)
-            throw hresult_error(E_FAIL,L"页面位图超出资源限制。");
+            throw hresult_error(E_FAIL,L"页面位图超出资源限制："+std::to_wstring(r.width)+L" × "+std::to_wstring(r.height)+L"，请求尺寸 "+std::to_wstring(w)+L" × "+std::to_wstring(h)+L"，字节数 "+std::to_wstring(bytes.size())+L"。");
         r.pixels.assign(bytes.begin(),bytes.end());
         return r;
     }
 };
 
 struct App {
-    HWND window{},canvas{},pageEdit{},totalLabel{},zoomLabel{};
+    HWND window{},canvas{},pageEdit{},totalLabel{},zoomLabel{},findEdit{},findLabel{};
     HFONT font{},titleFont{},smallFont{};
     HBRUSH white=CreateSolidBrush(RGB(255,255,255)), background=CreateSolidBrush(RGB(232,236,241));
     std::vector<HWND> controls;
     std::thread worker;
+    std::thread findWorker;
+    std::mutex findMutex;
+    std::condition_variable findCondition;
+    std::optional<FindTask> pendingFind;
+    std::atomic<uint64_t> findLatest{0};
+    std::vector<HWND> findControls;
+    std::vector<SearchHit> findHits;
+    std::wstring findQuery,findPassword;
+    int findIndex=-1,findDirection=1;
+    uint32_t findAnchor=0;
+    bool findVisible=false,findRunning=false,findMatchCase=false,findCapped=false,findReveal=false,resettingFind=false;
     std::mutex mutex;
     std::condition_variable condition;
     std::optional<Request> pending;
@@ -198,9 +227,16 @@ struct App {
         });
     }
     void Shutdown() {
-        stop=true; ++latest; condition.notify_one();
+        stop=true; ++latest; ++findLatest; condition.notify_one();findCondition.notify_one();
         if(worker.joinable()) worker.join();
-        MSG msg; while(PeekMessageW(&msg,window,WM_RESULT,WM_RESULT,PM_REMOVE)) delete reinterpret_cast<Result*>(msg.lParam);
+        if(findWorker.joinable())findWorker.join();
+        if(!findPassword.empty())SecureZeroMemory(findPassword.data(),findPassword.size()*sizeof(wchar_t));findPassword.clear();
+        pendingFind.reset();
+        MSG msg; while(PeekMessageW(&msg,window,WM_RESULT,WM_FIND_PROGRESS,PM_REMOVE)) {
+            if(msg.message==WM_RESULT)delete reinterpret_cast<Result*>(msg.lParam);
+            else if(msg.message==WM_FIND_RESULT)delete reinterpret_cast<SearchResult*>(msg.lParam);
+            else delete reinterpret_cast<SearchProgress*>(msg.lParam);
+        }
     }
     ~App(){Shutdown(); DeleteObject(font);DeleteObject(titleFont);DeleteObject(smallFont);DeleteObject(white);DeleteObject(background);}
     RECT View()const {RECT r{};GetClientRect(canvas,&r);return r;}
@@ -220,9 +256,126 @@ struct App {
         smallFont=CreateFontW(-Px(12),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei UI");
         for(auto c:controls)SendMessageW(c,WM_SETFONT,reinterpret_cast<WPARAM>(font),TRUE);
     }
+    std::wstring FindText()const {
+        int length=GetWindowTextLengthW(findEdit);std::wstring text(length+1,L'\0');
+        GetWindowTextW(findEdit,text.data(),length+1);text.resize(length);return text;
+    }
+    void CancelFind(bool releaseDocument=false,bool clearText=false) {
+        KillTimer(window,3);++findLatest;findRunning=false;findQuery.clear();findHits.clear();findIndex=-1;findCapped=false;findReveal=false;
+        {std::lock_guard<std::mutex> lock(findMutex);pendingFind.reset();
+            if(releaseDocument&&findWorker.joinable()){pendingFind.emplace();pendingFind->generation=findLatest.load();}}
+        findCondition.notify_one();
+        if(clearText){resettingFind=true;SetWindowTextW(findEdit,L"");resettingFind=false;}
+        SetWindowTextW(findLabel,L"输入关键词");
+        UpdateControls();InvalidateRect(canvas,nullptr,FALSE);
+    }
+    void ResetFindDocument() {
+        CancelFind(true,true);
+        if(!findPassword.empty())SecureZeroMemory(findPassword.data(),findPassword.size()*sizeof(wchar_t));findPassword.clear();
+    }
+    void StartFindWorker() {
+        if(findWorker.joinable())return;
+        findWorker=std::thread([this]{
+            std::unique_ptr<TextSearchEngine> engine;
+            while(!stop) {
+                FindTask task;
+                {std::unique_lock<std::mutex> lock(findMutex);findCondition.wait(lock,[this]{return stop||pendingFind.has_value();});
+                    if(stop)break;task=std::move(*pendingFind);pendingFind.reset();}
+                if(task.source.path.empty()){if(engine)engine->Clear();continue;}
+                auto result=std::make_unique<SearchResult>();result->generation=task.generation;result->query=task.query;
+                try {
+                    if(!engine)engine=std::make_unique<TextSearchEngine>();
+                    auto lastProgress=std::chrono::steady_clock::now()-1s;
+                    *result=engine->Find(task.source,task.query,task.matchCase,task.generation,&findLatest,&stop,
+                        [&](const SearchProgress& value){
+                            auto now=std::chrono::steady_clock::now();
+                            if(value.scanned!=value.total&&now-lastProgress<100ms)return;lastProgress=now;
+                            if(stop||findLatest!=task.generation)return;
+                            auto progress=std::make_unique<SearchProgress>(value);
+                            if(PostMessageW(window,WM_FIND_PROGRESS,0,reinterpret_cast<LPARAM>(progress.get())))progress.release();
+                        });
+                }catch(const SearchCancelled&){continue;}
+                catch(const SearchError& e){result->error=e.message;}
+                catch(...){result->error=L"搜索失败，文档无法读取或可用内存不足。";}
+                if(!stop&&findLatest==task.generation&&PostMessageW(window,WM_FIND_RESULT,0,reinterpret_cast<LPARAM>(result.get())))result.release();
+            }
+        });
+    }
+    void BeginFind(int direction=1) {
+        KillTimer(window,3);if(!pageCount||!findVisible)return;
+        auto text=FindText();CancelFind();
+        if(text.find_first_not_of(L" \t\r\n")==std::wstring::npos)return;
+        findQuery=text;findMatchCase=Button_GetCheck(GetDlgItem(window,FindCase))==BST_CHECKED;
+        findDirection=direction;findAnchor=request.page;findRunning=true;
+        SetWindowTextW(findLabel,L"正在搜索文字层…");StartFindWorker();
+        {std::lock_guard<std::mutex> lock(findMutex);pendingFind.emplace();auto& task=*pendingFind;
+            task.source.fileId=request.fileId;task.source.path=request.path;task.source.embedded=request.embedded;task.source.password=findPassword;
+            task.generation=findLatest.load();task.query=findQuery;task.matchCase=findMatchCase;}
+        findCondition.notify_one();UpdateControls();
+    }
+    void FindEdited() {
+        if(resettingFind||!findVisible||!pageCount)return;
+        CancelFind();if(!FindText().empty())SetTimer(window,3,300,nullptr);
+    }
+    void ShowFind() {
+        if(!findVisible){findVisible=true;Layout();if(pageCount)Queue();}
+        SetFocus(findEdit);SendMessageW(findEdit,EM_SETSEL,0,-1);
+        if(!FindText().empty()&&findQuery.empty())BeginFind();
+    }
+    void CloseFind() {
+        CancelFind(true);findVisible=false;Layout();if(pageCount)Queue();SetFocus(canvas);
+    }
+    void UpdateFindLabel() {
+        if(findHits.empty())return;
+        auto text=std::to_wstring(findIndex+1)+L" / "+std::to_wstring(findHits.size())+(findCapped?L"+":L"");
+        if(findIndex>=0)text+=L"  ·  第 "+std::to_wstring(findHits[size_t(findIndex)].page+1)+L" 页";
+        SetWindowTextW(findLabel,text.c_str());
+    }
+    void RevealFindHit() {
+        if(!bitmap||findIndex<0||size_t(findIndex)>=findHits.size())return;
+        auto& hit=findHits[size_t(findIndex)];if(hit.page!=bitmap->page||hit.rectangles.empty())return;
+        auto box=RotateSearchRect(hit.rectangles.front(),request.rotation);auto v=View();
+        int x=std::max(Px(24),(int(v.right)-int(bitmap->width))/2),y=std::max(Px(24),(int(v.bottom)-int(bitmap->height))/2);
+        int left=x+int(box.left*bitmap->width),right=x+int(box.right*bitmap->width);
+        int top=y+int(box.top*bitmap->height),bottom=y+int(box.bottom*bitmap->height);
+        if(left-scrollX<Px(16)||right-scrollX>v.right-Px(16))scrollX=(left+right)/2-int(v.right)/2;
+        if(top-scrollY<Px(16)||bottom-scrollY>v.bottom-Px(16))scrollY=(top+bottom)/2-int(v.bottom)/2;
+        UpdateScroll();InvalidateRect(canvas,nullptr,FALSE);
+    }
+    void SelectFindHit(int index) {
+        if(findHits.empty())return;findIndex=(index+int(findHits.size()))%int(findHits.size());UpdateFindLabel();
+        auto page=findHits[size_t(findIndex)].page;
+        if(page!=request.page){Navigate(page);findReveal=true;}
+        else if(busy)findReveal=true;
+        else RevealFindHit();
+        InvalidateRect(canvas,nullptr,FALSE);
+    }
+    void StepFind(int direction) {
+        if(!findVisible){ShowFind();return;}
+        if(findQuery!=FindText()||findMatchCase!=(Button_GetCheck(GetDlgItem(window,FindCase))==BST_CHECKED)) {BeginFind(direction);return;}
+        if(!findRunning&&!findHits.empty()){SelectFindHit(findIndex+direction);SetFocus(findEdit);}
+    }
+    void PaintFindHighlights(HDC dc,int x,int y,const Result& rendered) {
+        if(!findVisible||findHits.empty())return;
+        HDC tint=CreateCompatibleDC(dc);HBITMAP pixel=CreateCompatibleBitmap(dc,1,1);auto old=SelectObject(tint,pixel);
+        SetPixel(tint,0,0,RGB(255,204,48));
+        HBRUSH normal=CreateSolidBrush(RGB(217,161,20)),selected=CreateSolidBrush(RGB(229,106,15));auto view=View();
+        for(size_t index=0;index<findHits.size();++index){auto& hit=findHits[index];if(hit.page!=rendered.page)continue;
+            for(auto box:hit.rectangles){box=RotateSearchRect(box,request.rotation);
+                RECT rectangle{x+int(std::floor(box.left*rendered.width))-1,y+int(std::floor(box.top*rendered.height))-1,
+                    x+int(std::ceil(box.right*rendered.width))+1,y+int(std::ceil(box.bottom*rendered.height))+1},visible{};
+                if(!IntersectRect(&visible,&rectangle,&view))continue;
+                BLENDFUNCTION blend{AC_SRC_OVER,0,BYTE(int(index)==findIndex?100:55),0};
+                AlphaBlend(dc,rectangle.left,rectangle.top,rectangle.right-rectangle.left,rectangle.bottom-rectangle.top,tint,0,0,1,1,blend);
+                FrameRect(dc,&rectangle,int(index)==findIndex?selected:normal);
+            }}
+        DeleteObject(normal);DeleteObject(selected);SelectObject(tint,old);DeleteObject(pixel);DeleteDC(tint);
+    }
     void UpdateControls() {
         bool loaded=pageCount>0;
-        for(auto c:controls){int id=GetDlgCtrlID(c);if(id!=Open&&id!=Help&&id!=Full)EnableWindow(c,loaded);}
+        for(auto c:controls){int id=GetDlgCtrlID(c);if(id!=Open&&id!=Help&&id!=Full&&id!=FindDismiss)EnableWindow(c,loaded);}
+        EnableWindow(GetDlgItem(window,FindPrev),loaded&&!findRunning&&!findHits.empty());
+        EnableWindow(GetDlgItem(window,FindNext),loaded&&!findRunning&&!findHits.empty());
         EnableWindow(GetDlgItem(window,Prev),loaded&&request.page>0);
         EnableWindow(GetDlgItem(window,Next),loaded&&request.page+1<pageCount);
         SetWindowTextW(pageEdit,loaded?std::to_wstring(request.page+1).c_str():L"—");
@@ -233,12 +386,14 @@ struct App {
         bottomOnArrival=false;wheelRemainder=0;
         try { request.path=LocalPath(path); }
         catch(const hresult_error& e){MessageBoxW(window,e.message().c_str(),L"无法打开",MB_ICONINFORMATION);return;}
+        ResetFindDocument();
         request.embedded.reset();
         KillTimer(window,1); ++request.fileId;request.password.clear();request.page=0;request.rotation=0;request.fit=Fit::Page;
         pageCount=0;bitmap.reset();scrollX=scrollY=0;
         SetWindowTextW(window,(std::filesystem::path(request.path).filename().wstring()+L" — "+APP_NAME).c_str());Queue(true);
     }
     void OpenEmbedded(std::shared_ptr<std::vector<uint8_t>> bytes,const std::wstring& title) {
+        ResetFindDocument();
         bottomOnArrival=false;wheelRemainder=0;
         KillTimer(window,2);KillTimer(window,1);request.embedded=std::move(bytes);request.path=L"Excel 内嵌 PDF";
         ++request.fileId;request.password.clear();request.page=0;request.rotation=0;request.fit=Fit::Page;pageCount=0;
@@ -252,12 +407,13 @@ struct App {
         if(GetOpenFileNameW(&o))OpenFile(filename.data());
     }
     void CloseFile() {
+        ResetFindDocument();
         bottomOnArrival=false;wheelRemainder=0;
         KillTimer(window,1);++latest;request.path.clear();request.embedded.reset();request.password.clear();++request.fileId;pageCount=0;bitmap.reset();busy=false;
         {std::lock_guard<std::mutex> lock(mutex);pending=request;}condition.notify_one();
         status=L"本地阅读 · 不保存历史";SetWindowTextW(window,APP_NAME);UpdateControls();UpdateScroll();InvalidateRect(window,nullptr,TRUE);InvalidateRect(canvas,nullptr,FALSE);
     }
-    void Navigate(int64_t p,bool arriveBottom=false) {if(!pageCount)return;auto n=uint32_t(std::clamp<int64_t>(p,0,pageCount-1));if(n!=request.page){bottomOnArrival=arriveBottom;request.page=n;Queue(true);}SetFocus(canvas);}
+    void Navigate(int64_t p,bool arriveBottom=false) {if(!pageCount)return;findReveal=false;auto n=uint32_t(std::clamp<int64_t>(p,0,pageCount-1));if(n!=request.page){bottomOnArrival=arriveBottom;request.page=n;Queue(true);}SetFocus(canvas);}
     void Wheel(int delta){
         if(!pageCount||!bitmap||busy)return;
         if((wheelRemainder<0&&delta>0)||(wheelRemainder>0&&delta<0))wheelRemainder=0;
@@ -280,6 +436,10 @@ struct App {
         case Prev:Navigate(int64_t(request.page)-1);break;
         case Next:Navigate(int64_t(request.page)+1);break;
         case GoPage:SetFocus(pageEdit);SendMessageW(pageEdit,EM_SETSEL,0,-1);break;
+        case Find:ShowFind();break;
+        case FindPrev:StepFind(-1);break;case FindNext:StepFind(1);break;
+        case FindCase:BeginFind();SetFocus(findEdit);break;
+        case FindDismiss:CloseFind();break;
         case ZoomIn:Zoom(1.25);break;case ZoomOut:Zoom(0.8);break;
         case FitPage:case FitWidth:case Actual:if(pageCount){request.fit=cmd==FitPage?Fit::Page:cmd==FitWidth?Fit::Width:Fit::Custom;request.zoom=1;scrollX=scrollY=0;Queue();SetFocus(canvas);}break;
         case Rotate:if(pageCount){request.rotation=(request.rotation+1)%4;Queue(true);}SetFocus(canvas);break;
@@ -288,7 +448,7 @@ struct App {
         case Help:{HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING,HelpDetails,L"使用帮助");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,AssociatePdf,L"关联 PDF / 设为默认阅读器");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,EnableExcel,L"启用 Excel 内嵌 PDF");AppendMenuW(menu,MF_STRING,DisableExcel,L"恢复原有 Excel PDF 关联");RECT r{};GetWindowRect(GetDlgItem(window,Help),&r);int selected=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_LEFTALIGN,r.left,r.bottom,0,window,nullptr);DestroyMenu(menu);if(selected)Command(selected);break;}
         case AssociatePdf:if(RegisterPdf()==0)ShellExecuteW(window,L"open",L"ms-settings:defaultapps?registeredAppUser=BaoziPDF",nullptr,nullptr,SW_SHOWNORMAL);break;
         case EnableExcel:case DisableExcel:if(RegisterExcel(cmd==EnableExcel)==0)MessageBoxW(window,cmd==EnableExcel?L"已为当前用户启用。\n\n请关闭 Adobe 和 Excel，再重新打开工作簿。\n之后双击已有的 Adobe 类型 PDF 图标即可阅读。\n\n请将本程序保留在当前位置；移动后需重新启用。":L"已恢复启用前的 Excel PDF 对象关联。\n请重新打开 Excel。",L"Excel 内嵌 PDF",MB_OK);break;
-        case HelpDetails:MessageBoxW(window,L"包子PDF  1.0\n\n打开文件  Ctrl+O   ·   支持拖入 PDF\n翻页  ← / → 或 PageUp / PageDown\n首页 / 末页  Home / End\n跳转页码  Ctrl+G，输入后按 Enter\n缩放  Ctrl+滚轮 或 + / −\n适合整页  Ctrl+0   ·   适合宽度  Ctrl+1\n原始大小  Ctrl+2   ·   顺时针旋转  R\n全屏  F11   ·   退出全屏  Esc\n关闭文档  Ctrl+W   ·   退出程序  Alt+F4\n滚轮上下移动，到页边界继续滚动可翻页；拖动页面、滚动条或上下方向键平移；Shift+滚轮横向滚动。\n\n使用 Windows 系统 PDF 能力。只读、无账号、无联网代码、\n无更新器、无历史记录、无后台服务。\n支持已验收的 Adobe 类型 Excel 内嵌 PDF（需注册）。\n本版不提供文字选择、搜索、目录或 PDF 编辑。",L"使用帮助",MB_OK);break;
+        case HelpDetails:MessageBoxW(window,L"包子PDF  1.1\n\n打开文件  Ctrl+O   ·   支持拖入 PDF\n翻页  ← / → 或 PageUp / PageDown\n首页 / 末页  Home / End\n跳转页码  Ctrl+G，输入后按 Enter\n搜索文字层  Ctrl+F；Enter / Shift+Enter 跳转\n下一处 / 上一处  F3 / Shift+F3；Esc 关闭搜索\n缩放  Ctrl+滚轮 或 + / −\n适合整页  Ctrl+0   ·   适合宽度  Ctrl+1\n原始大小  Ctrl+2   ·   顺时针旋转  R\n全屏  F11   ·   退出全屏  Esc\n关闭文档  Ctrl+W   ·   退出程序  Alt+F4\n滚轮上下移动，到页边界继续滚动可翻页；拖动页面、滚动条或上下方向键平移；Shift+滚轮横向滚动。\n\n使用 Windows 系统 PDF 能力。只读、无账号、无联网代码、\n无更新器、无历史记录、无后台服务。\n支持已验收的 Adobe 类型 Excel 内嵌 PDF（需注册）。\nPDFium 精确搜索文字层，支持高亮与区分大小写。\n扫描图片不参与搜索；本版不提供文字选择、目录或 PDF 编辑。",L"使用帮助",MB_OK);break;
         }
     }
     void UpdateScroll() {
@@ -300,9 +460,21 @@ struct App {
     void Scroll(int dx,int dy) {scrollX+=dx;scrollY+=dy;UpdateScroll();InvalidateRect(canvas,nullptr,FALSE);}
     void Layout() {
         RECT c{};GetClientRect(window,&c);int x=Px(16),y=Px(12),h=Px(30);
-        const std::pair<int,int> specs[]={{Open,82},{Prev,36},{Next,36},{PageEdit,52},{500,64},{ZoomOut,34},{501,60},{ZoomIn,34},{FitPage,76},{FitWidth,76},{Rotate,56},{Full,56},{Help,48}};
+        const std::pair<int,int> specs[]={{Open,82},{Prev,36},{Next,36},{PageEdit,52},{500,64},{ZoomOut,34},{501,60},{ZoomIn,34},{FitPage,76},{FitWidth,76},{Rotate,56},{Full,56},{Find,56},{Help,48}};
         for(auto s:specs){MoveWindow(GetDlgItem(window,s.first),x,y,Px(s.second),h,TRUE);x+=Px(s.second+6);}
-        MoveWindow(canvas,0,Px(54),c.right,std::max(0,int(c.bottom)-Px(84)),TRUE);UpdateScroll();
+        for(auto control:findControls)ShowWindow(control,findVisible?SW_SHOW:SW_HIDE);
+        int top=Px(54);
+        if(findVisible){
+            int fy=Px(58),fx=Px(16),field=std::clamp(int(c.right)-Px(620),Px(180),Px(360));
+            MoveWindow(GetDlgItem(window,502),fx,fy,Px(40),h,TRUE);fx+=Px(46);
+            MoveWindow(findEdit,fx,fy,field,h,TRUE);fx+=field+Px(8);
+            MoveWindow(GetDlgItem(window,FindPrev),fx,fy,Px(70),h,TRUE);fx+=Px(76);
+            MoveWindow(GetDlgItem(window,FindNext),fx,fy,Px(70),h,TRUE);fx+=Px(82);
+            MoveWindow(GetDlgItem(window,FindCase),fx,fy,Px(118),h,TRUE);fx+=Px(126);
+            MoveWindow(findLabel,fx,fy,std::max(Px(100),int(c.right)-fx-Px(58)),h,TRUE);
+            MoveWindow(GetDlgItem(window,FindDismiss),c.right-Px(48),fy,Px(32),h,TRUE);top=Px(100);
+        }
+        MoveWindow(canvas,0,top,c.right,std::max(0,int(c.bottom)-top-Px(30)),TRUE);UpdateScroll();
         InvalidateRect(window,nullptr,FALSE);
     }
 };
@@ -328,6 +500,7 @@ LRESULT CALLBACK CanvasProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
             RECT shadow{x+3,y+4,x+int(b.width)+3,y+int(b.height)+4};FillRect(mem,&shadow,GetSysColorBrush(COLOR_3DSHADOW));
             BITMAPINFO bi{};bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);bi.bmiHeader.biWidth=b.width;bi.bmiHeader.biHeight=-LONG(b.height);bi.bmiHeader.biPlanes=1;bi.bmiHeader.biBitCount=32;bi.bmiHeader.biCompression=BI_RGB;
             SetDIBitsToDevice(mem,x,y,b.width,b.height,0,0,0,b.height,b.pixels.data(),&bi,DIB_RGB_COLORS);
+            app->PaintFindHighlights(mem,x,y,b);
         }else{int cy=int(v.bottom)/2;RECT r{0,cy-app->Px(100),v.right,cy-app->Px(45)};
             DrawLabel(mem,APP_NAME,r,app->titleFont,RGB(30,48,65),DT_CENTER|DT_VCENTER|DT_SINGLELINE);
             r.top=cy-app->Px(20);r.bottom=cy+app->Px(20);DrawLabel(mem,app->busy?L"正在打开文档…":L"把 PDF 拖到这里，开始阅读",r,app->font,RGB(80,95,110),DT_CENTER|DT_VCENTER|DT_SINGLELINE);
@@ -359,21 +532,46 @@ LRESULT CALLBACK MainProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
         app->pageEdit=create(PageEdit,L"EDIT",L"",ES_NUMBER|ES_CENTER|ES_AUTOHSCROLL|WS_TABSTOP);SendMessageW(app->pageEdit,EM_SETLIMITTEXT,9,0);
         app->totalLabel=create(500,L"STATIC",L"/ —",SS_CENTERIMAGE);
         create(ZoomOut,L"BUTTON",L"−",BS_PUSHBUTTON|WS_TABSTOP);app->zoomLabel=create(501,L"STATIC",L"—",SS_CENTER|SS_CENTERIMAGE);create(ZoomIn,L"BUTTON",L"+",BS_PUSHBUTTON|WS_TABSTOP);
-        create(FitPage,L"BUTTON",L"整页",BS_PUSHBUTTON|WS_TABSTOP);create(FitWidth,L"BUTTON",L"宽度",BS_PUSHBUTTON|WS_TABSTOP);create(Rotate,L"BUTTON",L"旋转",BS_PUSHBUTTON|WS_TABSTOP);create(Full,L"BUTTON",L"全屏",BS_PUSHBUTTON|WS_TABSTOP);create(Help,L"BUTTON",L"帮助",BS_PUSHBUTTON|WS_TABSTOP);
+        create(FitPage,L"BUTTON",L"整页",BS_PUSHBUTTON|WS_TABSTOP);create(FitWidth,L"BUTTON",L"宽度",BS_PUSHBUTTON|WS_TABSTOP);create(Rotate,L"BUTTON",L"旋转",BS_PUSHBUTTON|WS_TABSTOP);create(Full,L"BUTTON",L"全屏",BS_PUSHBUTTON|WS_TABSTOP);create(Find,L"BUTTON",L"搜索",BS_PUSHBUTTON|WS_TABSTOP);create(Help,L"BUTTON",L"帮助",BS_PUSHBUTTON|WS_TABSTOP);
+        auto findCreate=[&](int id,const wchar_t* cls,const wchar_t* text,DWORD style){auto control=create(id,cls,text,style);app->findControls.push_back(control);return control;};
+        findCreate(502,L"STATIC",L"查找",SS_CENTERIMAGE);
+        app->findEdit=findCreate(FindEdit,L"EDIT",L"",ES_AUTOHSCROLL|WS_TABSTOP);
+        SendMessageW(app->findEdit,EM_SETLIMITTEXT,256,0);SendMessageW(app->findEdit,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"搜索 PDF 文字层"));
+        ImmAssociateContextEx(app->findEdit,nullptr,IACE_DEFAULT);
+        findCreate(FindPrev,L"BUTTON",L"上一处",BS_PUSHBUTTON|WS_TABSTOP);findCreate(FindNext,L"BUTTON",L"下一处",BS_PUSHBUTTON|WS_TABSTOP);
+        findCreate(FindCase,L"BUTTON",L"区分大小写",BS_AUTOCHECKBOX|WS_TABSTOP);
+        app->findLabel=findCreate(503,L"STATIC",L"输入关键词",SS_CENTERIMAGE);
+        findCreate(FindDismiss,L"BUTTON",L"×",BS_PUSHBUTTON|WS_TABSTOP);
         app->canvas=CreateWindowExW(0,L"BaoziCanvas",L"PDF 页面",WS_CHILD|WS_VISIBLE|WS_HSCROLL|WS_VSCROLL|WS_TABSTOP,0,0,1,1,hwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
         ImmAssociateContext(app->canvas,nullptr);ImmAssociateContext(app->pageEdit,nullptr);
         DragAcceptFiles(hwnd,TRUE);DragAcceptFiles(app->canvas,TRUE);app->SetFonts();app->Layout();app->UpdateControls();app->StartWorker();return 0;}
-    case WM_COMMAND:if(HIWORD(wp)==BN_CLICKED)app->Command(LOWORD(wp));return 0;
+    case WM_COMMAND:if(LOWORD(wp)==FindEdit&&HIWORD(wp)==EN_CHANGE)app->FindEdited();else if(HIWORD(wp)==BN_CLICKED)app->Command(LOWORD(wp));return 0;
     case WM_MOUSEWHEEL:if(app&&app->canvas)return SendMessageW(app->canvas,msg,wp,lp);return 0;
     case WM_SIZE:if(app&&app->canvas){app->Layout();if(wp!=SIZE_MINIMIZED&&!app->request.path.empty())SetTimer(hwnd,1,150,nullptr);}return 0;
-    case WM_TIMER:if(wp==2){KillTimer(hwnd,2);if(!IsWindowVisible(hwnd))PostMessageW(hwnd,WM_CLOSE,0,0);}else{KillTimer(hwnd,1);if(!app->request.path.empty())app->Queue();}return 0;
-    case WM_GETMINMAXINFO:{auto m=reinterpret_cast<MINMAXINFO*>(lp);m->ptMinTrackSize={app?app->Px(930):930,app?app->Px(420):420};return 0;}
+    case WM_TIMER:if(wp==3)app->BeginFind();else if(wp==2){KillTimer(hwnd,2);if(!IsWindowVisible(hwnd))PostMessageW(hwnd,WM_CLOSE,0,0);}else{KillTimer(hwnd,1);if(!app->request.path.empty())app->Queue();}return 0;
+    case WM_GETMINMAXINFO:{auto m=reinterpret_cast<MINMAXINFO*>(lp);m->ptMinTrackSize={app?app->Px(1000):1000,app?app->Px(420):420};return 0;}
     case WM_DPICHANGED:app->dpi=HIWORD(wp);app->SetFonts();{auto r=reinterpret_cast<RECT*>(lp);SetWindowPos(hwnd,nullptr,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOZORDER|SWP_NOACTIVATE);}return 0;
     case WM_CTLCOLORSTATIC:case WM_CTLCOLOREDIT:SetBkColor(reinterpret_cast<HDC>(wp),RGB(255,255,255));SetTextColor(reinterpret_cast<HDC>(wp),RGB(40,52,65));return reinterpret_cast<LRESULT>(app->white);
     case WM_ERASEBKGND:return 1;
     case WM_PAINT:{PAINTSTRUCT ps;auto dc=BeginPaint(hwnd,&ps);RECT r{};GetClientRect(hwnd,&r);FillRect(dc,&r,app->white);r.top=r.bottom-app->Px(30);r.left=app->Px(16);
         DrawLabel(dc,app->status,r,app->smallFont,RGB(81,100,112));r.right-=app->Px(16);DrawLabel(dc,L"F11 全屏   ·   Ctrl+O 打开",r,app->smallFont,RGB(100,116,129),DT_RIGHT|DT_VCENTER|DT_SINGLELINE);EndPaint(hwnd,&ps);return 0;}
     case WM_DROPFILES:{auto drop=reinterpret_cast<HDROP>(wp);UINT n=DragQueryFileW(drop,0,nullptr,0);std::wstring path(n+1,L'\0');DragQueryFileW(drop,0,path.data(),n+1);DragFinish(drop);path.resize(n);if(n)app->OpenFile(path);return 0;}
+    case WM_FIND_PROGRESS:{std::unique_ptr<SearchProgress> progress(reinterpret_cast<SearchProgress*>(lp));
+        if(progress->generation!=app->findLatest||!app->findVisible)return 0;
+        auto text=L"搜索 "+std::to_wstring(progress->scanned)+L" / "+std::to_wstring(progress->total)+L" 页 · "+std::to_wstring(progress->matches)+L" 处";
+        SetWindowTextW(app->findLabel,text.c_str());return 0;}
+    case WM_FIND_RESULT:{std::unique_ptr<SearchResult> result(reinterpret_cast<SearchResult*>(lp));
+        if(result->generation!=app->findLatest||!app->findVisible)return 0;
+        app->findRunning=false;app->findHits=std::move(result->hits);app->findCapped=result->capped;app->UpdateControls();
+        if(!result->error.empty()){SetWindowTextW(app->findLabel,L"搜索失败");MessageBoxW(hwnd,result->error.c_str(),L"文字搜索",MB_ICONINFORMATION);}
+        else if(app->findHits.empty())SetWindowTextW(app->findLabel,result->textPages?L"未找到匹配文字":L"没有可搜索的文字层");
+        else {
+            int selected=0;
+            if(app->findDirection<0){selected=int(app->findHits.size())-1;for(int i=int(app->findHits.size())-1;i>=0;--i)if(app->findHits[size_t(i)].page<=app->findAnchor){selected=i;break;}}
+            else {for(size_t i=0;i<app->findHits.size();++i)if(app->findHits[i].page>=app->findAnchor){selected=int(i);break;}}
+            app->SelectFindHit(selected);SetFocus(app->findEdit);
+        }
+        InvalidateRect(app->canvas,nullptr,FALSE);return 0;}
     case WM_RESULT:{std::unique_ptr<Result> r(reinterpret_cast<Result*>(lp));if(r->generation!=app->latest)return 0;app->busy=false;
         if(FAILED(r->error)){
             if(r->error==HRESULT_FROM_WIN32(ERROR_WRONG_PASSWORD)){
@@ -381,10 +579,15 @@ LRESULT CALLBACK MainProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
             }else{std::wostringstream out;out<<L"无法显示这份 PDF。请确认文件完整，且是受支持的 PDF。\n\n"<<r->message<<L"\n错误码：0x"<<std::hex<<std::uppercase<<uint32_t(r->error);MessageBoxW(hwnd,out.str().c_str(),L"打开 / 渲染失败",MB_ICONINFORMATION);}
             app->CloseFile();return 0;
         }
-        if(!app->request.password.empty()){SecureZeroMemory(app->request.password.data(),app->request.password.size()*sizeof(wchar_t));app->request.password.clear();}
+        if(!app->request.password.empty()){
+            if(!app->findPassword.empty())SecureZeroMemory(app->findPassword.data(),app->findPassword.size()*sizeof(wchar_t));
+            app->findPassword=app->request.password;
+            SecureZeroMemory(app->request.password.data(),app->request.password.size()*sizeof(wchar_t));app->request.password.clear();}
         app->pageCount=r->count;app->request.page=r->page;app->request.zoom=r->zoom;
         app->status=L"第 "+std::to_wstring(r->page+1)+L" / "+std::to_wstring(r->count)+L" 页   ·   只读"+(r->limited?L"   ·   已限制位图尺寸以控制内存":L"");
-        app->bitmap=std::move(r);if(app->bottomOnArrival){app->scrollY=INT_MAX;app->bottomOnArrival=false;}app->UpdateScroll();app->UpdateControls();InvalidateRect(app->canvas,nullptr,FALSE);InvalidateRect(hwnd,nullptr,FALSE);return 0;}
+        app->bitmap=std::move(r);if(app->bottomOnArrival){app->scrollY=INT_MAX;app->bottomOnArrival=false;}app->UpdateScroll();
+        if(app->findReveal){app->RevealFindHit();app->findReveal=false;}
+        app->UpdateControls();InvalidateRect(app->canvas,nullptr,FALSE);InvalidateRect(hwnd,nullptr,FALSE);return 0;}
     case WM_CLOSE:CloseOleObjects();app->Shutdown();DestroyWindow(hwnd);return 0;
     case WM_DESTROY:PostQuitMessage(0);return 0;
     }
@@ -402,7 +605,13 @@ int SelfTest(const std::wstring& directory,const std::wstring& output) {
         uint64_t dark=0;for(size_t i=0;i<r.pixels.size();i+=4)if(r.pixels[i]<180)++dark;
         check(dark>1000,"render contains visible content");
         auto rotated=render(L"sample.pdf",0,1,1);check(rotated.width==r.height&&rotated.height==r.width,"90-degree rotation swaps dimensions");
-        auto half=render(L"sample.pdf",0,0,0.5);check(std::abs(int(half.width)*2-int(r.width))<=1,"50-percent zoom");
+        auto half=render(L"sample.pdf",0,0,0.5);
+        // Destination sizes are rounded to whole DIPs before the system PDF
+        // engine rounds again to physical pixels. Allow that bounded error.
+        const int zoomTolerance=int(std::ceil(std::max(1.0,GetDpiForSystem()/96.0)))+1;
+        log<<"INFO\tzoom dimensions full="<<r.width<<'x'<<r.height<<" half="<<half.width<<'x'<<half.height<<" tolerance="<<zoomTolerance<<'\n';
+        check(!half.limited&&half.zoom==0.5&&std::abs(int(half.width)*2-int(r.width))<=zoomTolerance&&
+            std::abs(int(half.height)*2-int(r.height))<=zoomTolerance,"50-percent zoom");
         auto high=render(L"sample.pdf",0,0,8);check(high.limited&&uint64_t(high.width)*high.height<=MAX_PIXELS,"800-percent zoom memory cap");
         auto landscape=render(L"sample.pdf",1,0,1);check(landscape.width>landscape.height,"landscape page");
         check(render(L"sample.pdf",2,0,1).pixels.size()>0,"scanned-image page");
@@ -418,7 +627,7 @@ int SelfTest(const std::wstring& directory,const std::wstring& output) {
         for(uint32_t p=0;p<25;++p){q.page=(p*11)%250;auto page=engine.Render(q);if(page.page!=q.page)throw std::runtime_error("page mismatch");}
         check(true,"25 nonsequential page renders");log<<"INFO\t25 renders ms="<<std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count()<<"\n";
         engine.Clear();check(render(L"sample.pdf",0,0,1).count==4,"reopen after errors and document close");
-    }catch(const hresult_error& e){log<<"FAIL\tUnexpected HRESULT 0x"<<std::hex<<uint32_t(e.code())<<"\n";++failures;}
+    }catch(const hresult_error& e){log<<"FAIL\tUnexpected HRESULT 0x"<<std::hex<<uint32_t(e.code())<<"\t"<<to_string(e.message())<<"\n";++failures;}
     catch(const std::exception& e){log<<"FAIL\t"<<e.what()<<"\n";++failures;}
     log<<"RESULT\t"<<(failures?"FAIL":"PASS")<<"\tfailures="<<failures<<"\n";return failures?1:0;
 }
@@ -460,10 +669,11 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int show) {
         MSG msg;
         while(GetMessageW(&msg,nullptr,0,0)>0){
             bool handled=false;
-            if(msg.message==WM_KEYDOWN){bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;bool edit=GetFocus()==state.pageEdit;int key=int(msg.wParam);
-                if(ctrl){switch(key){case 'O':state.Command(Open);handled=true;break;case 'W':state.Command(CloseDoc);handled=true;break;case 'G':state.Command(GoPage);handled=true;break;case '0':state.Command(FitPage);handled=true;break;case '1':state.Command(FitWidth);handled=true;break;case '2':state.Command(Actual);handled=true;break;}}
+            if(msg.message==WM_KEYDOWN){bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;bool searchEdit=GetFocus()==state.findEdit;bool edit=GetFocus()==state.pageEdit||searchEdit;int key=int(msg.wParam);
+                if(ctrl){switch(key){case 'F':state.Command(Find);handled=true;break;case 'O':state.Command(Open);handled=true;break;case 'W':state.Command(CloseDoc);handled=true;break;case 'G':state.Command(GoPage);handled=true;break;case '0':state.Command(FitPage);handled=true;break;case '1':state.Command(FitWidth);handled=true;break;case '2':state.Command(Actual);handled=true;break;}}
+                if(!handled&&(key==VK_F3||(searchEdit&&key==VK_RETURN))){state.StepFind((GetKeyState(VK_SHIFT)&0x8000)?-1:1);handled=true;}
                 if(!handled&&key==VK_F11){state.ToggleFullscreen();handled=true;}
-                if(!handled&&key==VK_ESCAPE){if(state.fullscreen)state.ToggleFullscreen();SetFocus(state.canvas);handled=true;}
+                if(!handled&&key==VK_ESCAPE){if(state.findVisible)state.CloseFind();else{if(state.fullscreen)state.ToggleFullscreen();SetFocus(state.canvas);}handled=true;}
                 if(!handled&&edit&&key==VK_RETURN){wchar_t buf[32]{};GetWindowTextW(state.pageEdit,buf,32);auto page=_wtoi64(buf);if(page>=1&&page<=state.pageCount)state.Navigate(page-1);else{MessageBeep(MB_ICONINFORMATION);state.UpdateControls();SendMessageW(state.pageEdit,EM_SETSEL,0,-1);}handled=true;}
                 if(!handled&&!edit){switch(key){case VK_LEFT:case VK_PRIOR:state.Command(Prev);handled=true;break;case VK_RIGHT:case VK_NEXT:state.Command(Next);handled=true;break;case VK_HOME:state.Navigate(0);handled=true;break;case VK_END:state.Navigate(INT64_MAX);handled=true;break;case VK_ADD:case VK_OEM_PLUS:state.Command(ZoomIn);handled=true;break;case VK_SUBTRACT:case VK_OEM_MINUS:state.Command(ZoomOut);handled=true;break;case 'R':state.Command(Rotate);handled=true;break;case VK_UP:state.Scroll(0,-state.Px(60));handled=true;break;case VK_DOWN:state.Scroll(0,state.Px(60));handled=true;break;case VK_SPACE:if(state.bitmap&&int(state.bitmap->height)+state.Px(48)>state.View().bottom)state.Scroll(0,int(state.View().bottom)*9/10);else state.Command(Next);handled=true;break;}}
             }
